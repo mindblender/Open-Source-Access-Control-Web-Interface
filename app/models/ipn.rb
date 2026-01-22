@@ -58,17 +58,25 @@ class Ipn < ActiveRecord::Base
 
   private
   def create_payment
+    Rails.logger.info "IPN #{self.id}: Attempting to create payment for payer_email: #{self.payer_email}"
+
     # find user by email, then by payee
-    user = User.where("lower(email) = ?", self._from_email_address.downcase).first
-    user = User.where("lower(payee) = ?", self._from_email_address.downcase).first if user.nil? && self._from_email_address.present?
+    user = User.where("lower(email) = ?", self.payer_email.downcase).first
+    user = User.where("lower(payee) = ?", self.payer_email.downcase).first if user.nil? && self.payer_email.present?
 
     # Only create payments if the IPN matches a member
     if user.present?
+      Rails.logger.info "IPN #{self.id}: Found user #{user.id} (#{user.name})"
+
       # And is a payment (not a cancellation, etc)
       payment_types = ["subscr_payment","send_money"]
       if payment_types.include?(self.txn_type)
+        Rails.logger.info "IPN #{self.id}: Transaction type '#{self.txn_type}' is valid"
+
         # And a member level
         if User.member_levels[self.payment_gross.to_i].present?
+          Rails.logger.info "IPN #{self.id}: Payment amount #{self.payment_gross} matches member level"
+
           payment = Payment.new
           payment.date = Date.strptime(self.payment_date, "%H:%M:%S %b %e, %Y %Z")
           payment.user_id = user.id
@@ -76,16 +84,21 @@ class Ipn < ActiveRecord::Base
           if payment.save
             self.payment_id = payment.id
             self.save!
+            Rails.logger.info "IPN #{self.id}: Payment #{payment.id} created successfully for user #{user.id}"
           else
+            Rails.logger.error "IPN #{self.id}: Failed to save payment - #{payment.errors.full_messages.first}"
             return [false, "Unable to link payment. Payment error: #{payment.errors.full_messages.first}"]
           end
         else
+          Rails.logger.warn "IPN #{self.id}: Payment amount #{self.payment_gross.to_i} doesn't match any member level"
           return [false, "Unable to link payment. Couldn't find membership level '#{self.payment_gross.to_i}'."]
         end
       else
+        Rails.logger.warn "IPN #{self.id}: Transaction type '#{self.txn_type}' is not a valid payment type"
         return [false, "Unable to link payment. Transaction is a '#{self.txn_type}' instead of '#{payment_types.inspect}'."]
       end
     else
+      Rails.logger.warn "IPN #{self.id}: Could not find user with email or payee matching '#{self.payer_email}'"
       return [false, "Unable to link payment. Couldn't find user/payee '#{self.payer_email}'."]
     end
 

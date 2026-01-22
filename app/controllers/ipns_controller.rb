@@ -15,13 +15,25 @@ class IpnsController < ApplicationController
   end
 
   def create
+    Rails.logger.info "IPN received from PayPal"
+    Rails.logger.info "IPN params: #{params.inspect}"
+
     @ipn = Ipn.new_from_dynamic_params(params)
     @ipn.data = params.to_json
-    @ipn.save
+
+    if @ipn.save
+      Rails.logger.info "IPN saved successfully: ID #{@ipn.id}, txn_id: #{@ipn.txn_id}, payer_email: #{@ipn.payer_email}"
+
+      # Validate the IPN with PayPal (optional, can be disabled for testing)
+      # Uncomment the lines below to enable validation
+      #unless @ipn.validate!
+      #  Rails.logger.error "Unable to validate IPN: #{@ipn.inspect}"
+      #end
+    else
+      Rails.logger.error "Failed to save IPN: #{@ipn.errors.full_messages.join(', ')}"
+    end
+
     render :nothing => true
-    #unless @ipn.validate!
-    #  Rails.logger.error "Unable to validate IPN: #{@ipn.inspect}"
-    #end
   end
 
   def import
