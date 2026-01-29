@@ -89,6 +89,15 @@ end
 | Audit log UI | Modal/popup, show all entries (no pagination) |
 | Note-only entries | Supported (add comment without changing card data) |
 
+### Implementation Approach Decisions
+
+| Decision Area | Choice | Rationale |
+|---------------|--------|-----------|
+| Performance optimization | Keep it simple (N+1 acceptable) | Only ~181 cards currently; optimize later if needed |
+| Delete workflow UX | JavaScript prompt | Simpler initial implementation |
+| Arduino sync on delete | Manual (existing behavior) | Admin clicks "Upload All Cards" after deletion |
+| `name` field handling | Leave column, remove from UI | Safest approach; clean up in future release |
+
 ---
 
 ## Database Schema Changes
@@ -166,9 +175,10 @@ class AddSoftDeleteToCards < ActiveRecord::Migration
     add_column :cards, :deleted_at, :datetime
     add_index :cards, :deleted_at
 
-    # Optionally rename 'name' to 'legacy_name' for clarity
-    # Or remove it entirely after data migration
-    # rename_column :cards, :name, :legacy_name
+    # NOTE: The 'name' field is intentionally LEFT IN PLACE
+    # - Data will be migrated to audit logs
+    # - Field will be removed from UI (forms/views)
+    # - Column can be removed in a future cleanup migration
   end
 end
 ```
@@ -954,8 +964,27 @@ cannot :destroy, CardAuditLog
 ### Rollback Considerations
 
 - The data migration is **irreversible** by design (audit logs should not be deleted)
-- If rollback is needed, the `name` field still exists and can be used temporarily
-- Consider keeping `name` field for one release cycle before removing
+- The `name` field is intentionally preserved in the schema for rollback safety
+- If rollback is needed, the `name` field can be re-exposed in the UI temporarily
+
+### Future Cleanup (Optional)
+
+After the audit logging feature has been stable for a period of time, consider:
+
+```ruby
+# db/migrate/YYYYMMDDHHMMSS_remove_legacy_name_from_cards.rb
+# ONLY run this after confirming audit logging is working correctly
+
+class RemoveLegacyNameFromCards < ActiveRecord::Migration
+  def up
+    remove_column :cards, :name
+  end
+
+  def down
+    add_column :cards, :name, :string
+  end
+end
+```
 
 ---
 
@@ -1090,6 +1119,10 @@ end
 | Soft vs hard delete | Soft delete with preserved audit trail |
 | Audit log permissions | Admin only |
 | Note-only support | Yes, supported |
+| Performance optimization | Keep simple - N+1 acceptable for ~181 cards |
+| Delete workflow UX | JavaScript prompt (simple approach) |
+| Arduino sync on delete | Manual - admin uses "Upload All Cards" |
+| `name` field schema | Leave column in place, remove from UI only |
 
 ### Remaining Questions (for future consideration)
 
@@ -1124,11 +1157,12 @@ end
 | `app/models/ability.rb` | Add CardAuditLog permissions |
 | `app/controllers/cards_controller.rb` | Add audit logging to CRUD actions |
 | `app/views/cards/index.html.erb` | Add Note column, Audit Log link, modal |
-| `app/views/cards/_form.html.erb` | Add audit comment field, make ID read-only |
+| `app/views/cards/_form.html.erb` | Add audit comment field, make ID read-only, remove `name` field |
 | `app/assets/javascripts/cards.js.coffee` | Modal AJAX handling |
 | `config/routes.rb` | Add audit_log and add_note routes |
 
 ---
 
-**Document Version:** 1.0
+**Document Version:** 1.1
+**Last Updated:** 2026-01-29
 **Next Steps:** Review and approve, then proceed with implementation
