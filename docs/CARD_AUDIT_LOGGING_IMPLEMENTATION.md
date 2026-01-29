@@ -18,8 +18,10 @@
 7. [View Changes](#view-changes)
 8. [Authorization Changes](#authorization-changes)
 9. [Migration Strategy](#migration-strategy)
-10. [Testing Considerations](#testing-considerations)
-11. [Open Questions](#open-questions)
+10. [Implementation Phases](#implementation-phases)
+11. [Implementation Notes & Clarifications](#implementation-notes--clarifications)
+12. [Testing Considerations](#testing-considerations)
+13. [Open Questions](#open-questions)
 
 ---
 
@@ -197,7 +199,7 @@ class MigrateCardNamesToAuditLogs < ActiveRecord::Migration
       # Create initial audit entry for existing cards
       CardAuditLog.create!(
         card_id: card.id,
-        user_id: system_user&.id || 0,  # 0 = system migration
+        user_id: system_user.try(:id) || 0,  # 0 = system migration
         action: 'create',
         changes_json: {
           card_number: { old: nil, new: card.card_number },
@@ -282,8 +284,8 @@ class CardAuditLog < ActiveRecord::Base
         old_val = old_val == 1 ? 'Enabled' : 'Disabled' unless old_val == '(none)'
         new_val = new_val == 1 ? 'Enabled' : 'Disabled' unless new_val == '(none)'
       when 'user_id'
-        old_val = User.find_by_id(old_val)&.name || old_val unless old_val == '(none)'
-        new_val = User.find_by_id(new_val)&.name || new_val unless new_val == '(none)'
+        old_val = User.find_by_id(old_val).try(:name) || old_val unless old_val == '(none)'
+        new_val = User.find_by_id(new_val).try(:name) || new_val unless new_val == '(none)'
       end
 
       "#{field.titleize}: #{old_val} → #{new_val}"
@@ -333,7 +335,7 @@ class Card < ActiveRecord::Base
 
   # Get the most recent comment for display
   def latest_note
-    latest_audit_log&.comment
+    latest_audit_log.try(:comment)
   end
 
   # Soft delete implementation
@@ -659,7 +661,7 @@ end
   <tbody>
     <% @cards.each do |card| %>
       <tr>
-        <td><%= card.user&.name || '(unassigned)' %></td>
+        <td><%= card.user.try(:name) || '(unassigned)' %></td>
         <td><%= truncate(card.latest_note, length: 50) %></td>
         <td><%= card.id %></td>
         <td><%= card.card_number %></td>
@@ -705,7 +707,7 @@ end
 </div>
 <div class="modal-body">
   <p><strong>Card #:</strong> <%= @card.card_number %></p>
-  <p><strong>Assigned to:</strong> <%= @card.user&.name || '(unassigned)' %></p>
+  <p><strong>Assigned to:</strong> <%= @card.user.try(:name) || '(unassigned)' %></p>
 
   <hr>
 
@@ -726,7 +728,7 @@ end
         <% @audit_logs.each do |log| %>
           <tr>
             <td><%= log.created_at.strftime('%Y-%m-%d %H:%M') %></td>
-            <td><%= log.user&.name || 'System' %></td>
+            <td><%= log.user.try(:name) || 'System' %></td>
             <td>
               <span class="label label-<%= audit_action_class(log.action) %>">
                 <%= log.action_label %>
@@ -988,6 +990,182 @@ end
 
 ---
 
+## Implementation Phases
+
+This section provides a recommended order for implementation that allows incremental testing and minimizes risk.
+
+### Phase 1: Database & Model Foundation
+
+**Goal:** Create the database structure and basic models.
+
+1. Create `card_audit_logs` table migration
+2. Create `CardAuditLog` model with validations
+3. Add `deleted_at` column to cards table
+4. Update `Card` model with:
+   - Association to `card_audit_logs`
+   - Soft delete scopes
+   - `latest_audit_log` and `latest_note` methods
+   - `create_audit_log` method
+   - `calculate_changes` method
+
+**Checkpoint:** Verify models work in Rails console:
+```ruby
+# Test CardAuditLog creation
+card = Card.first
+CardAuditLog.create!(card_id: card.id, user_id: 1, action: 'note', comment: 'Test')
+card.latest_note  # Should return 'Test'
+```
+
+### Phase 2: Data Migration
+
+**Goal:** Migrate existing `name` field data to audit logs.
+
+5. Run data migration for existing cards
+
+**Checkpoint:** Verify all existing cards have audit entries:
+```ruby
+# Should return 0 (all cards have at least one audit entry)
+Card.unscoped.where('id NOT IN (SELECT DISTINCT card_id FROM card_audit_logs)').count
+
+# Verify migrated data
+Card.first.latest_note  # Should show "[Migrated] ..." if name was present
+```
+
+### Phase 3: Controller & Basic UI
+
+**Goal:** Enable audit logging for create/update operations.
+
+6. Update `CardsController`:
+   - Add `audit_comment` validation to `create` and `update`
+   - Create audit log entries on successful save
+7. Update `_form.html.erb`:
+   - Add audit comment textarea (required)
+   - Remove `name` field
+   - Make card ID read-only on edit, hidden on new
+8. Update `config/routes.rb` with new routes
+
+**Checkpoint:** Manually test create and update flows:
+- Create a new card with comment → verify audit log created
+- Edit a card with changes → verify 'update' action logged
+- Edit a card without changes → verify 'note' action logged
+
+### Phase 4: Index & Modal UI
+
+**Goal:** Display audit information in the card list.
+
+9. Update `index.html.erb`:
+   - Add "Note" column showing `card.latest_note`
+   - Add "Audit Log" column with "View" link
+   - Add modal container div
+10. Create `_audit_log_modal.html.erb` partial
+11. Create/update `cards_helper.rb` with `audit_action_class`
+12. Add JavaScript for modal AJAX loading
+
+**Checkpoint:** Test modal display:
+- Click "View" on a card → modal should show audit history
+- Verify formatting of changes, dates, user names
+
+### Phase 5: Delete Flow
+
+**Goal:** Implement soft delete with audit logging.
+
+13. Update delete link in `index.html.erb` with `delete-card` class
+14. Add JavaScript for delete comment prompt
+15. Update `destroy` action to use soft delete
+
+**Checkpoint:** Test delete flow:
+- Click Delete → should prompt for reason
+- Verify card is soft-deleted (not in list, but in `Card.unscoped`)
+- Verify 'delete' action logged
+
+### Phase 6: Authorization & Cleanup
+
+**Goal:** Lock down permissions and finalize.
+
+16. Update `ability.rb`:
+    - Add `CardAuditLog` permissions
+    - Add `cannot :update` and `cannot :destroy` for audit logs
+17. Remove `name` from `attr_accessible` in Card model (if still present)
+18. Final end-to-end testing
+
+**Checkpoint:** Verify permissions:
+- Non-admin cannot access audit logs directly
+- Even admin cannot edit/delete audit log entries
+
+---
+
+## Implementation Notes & Clarifications
+
+### Ruby 1.9.3 Compatibility
+
+**IMPORTANT:** This codebase runs on Ruby 1.9.3, which does not support the safe navigation operator (`&.`). All code examples in this document use `.try()` instead:
+
+```ruby
+# CORRECT (Ruby 1.9.3 compatible)
+card.user.try(:name)
+log.user.try(:name) || 'System'
+
+# INCORRECT (Ruby 2.3+ only)
+card.user&.name
+log.user&.name || 'System'
+```
+
+### Data Migration: Admin User Requirement
+
+The data migration requires at least one admin user to exist:
+
+```ruby
+system_user = User.where(admin: true).first
+```
+
+**Recommendation:** If no admin exists, the migration should fail with a clear error rather than using a placeholder:
+
+```ruby
+def up
+  system_user = User.where(admin: true).first
+  raise "Migration requires at least one admin user" if system_user.nil?
+
+  # ... rest of migration
+end
+```
+
+### Delete Button JavaScript Selector
+
+The JavaScript for delete confirmation targets `a.delete-card`. Ensure the delete link includes this class:
+
+```erb
+<!-- In index.html.erb -->
+<%= link_to 'Delete', card_path(card),
+    method: :delete,
+    class: 'btn btn-sm btn-danger delete-card',  # <-- Note: 'delete-card' class added
+    data: { confirm: false } %>  # Disable default Rails confirm
+```
+
+### Note-Only Entries: UI Discoverability
+
+Users may not realize they can add a note without changing fields. Add a hint to the form:
+
+```erb
+<!-- In _form.html.erb, under the audit_comment textarea -->
+<p class="help-block">
+  <strong>Required:</strong> This comment will be permanently recorded in the audit log.
+  <br>
+  <em>Tip: You can submit a comment without changing any fields to add a note to the audit history.</em>
+</p>
+```
+
+### Viewing Deleted Cards (Future Enhancement)
+
+With soft delete, deleted cards won't appear in the normal list. For the initial implementation:
+- Deleted cards are simply hidden from the UI
+- Audit logs for deleted cards are preserved and accessible if you know the card ID
+
+**Future enhancement** (not in scope for initial release):
+- Add "Show Deleted Cards" toggle on index page
+- Add "Restore" action for soft-deleted cards
+
+---
+
 ## Testing Considerations
 
 ### Unit Tests (Models)
@@ -1163,6 +1341,6 @@ end
 
 ---
 
-**Document Version:** 1.1
+**Document Version:** 1.2
 **Last Updated:** 2026-01-29
-**Next Steps:** Review and approve, then proceed with implementation
+**Next Steps:** Review and approve, then proceed with implementation following the phases outlined above
